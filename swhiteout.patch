@@ -1,0 +1,422 @@
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index aab3f5d..63bf343 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -61,6 +61,33 @@ struct dentry *ovl_lookup_temp(struct ovl_fs *ofs, struct dentry *workdir)
+ 	return temp;
+ }
+ 
++static struct dentry *ovl_nested_whiteout(struct ovl_fs *ofs, bool is_proxy)
++{
++	int err;
++	struct dentry *whiteout;
++	struct dentry *workdir = ofs->workdir;
++	struct inode *wdir = workdir->d_inode;
++
++	if (!ofs->nested_whiteout) {
++		whiteout = ovl_lookup_temp(ofs, workdir);
++		if (IS_ERR(whiteout))
++			goto out;
++
++		err = ovl_do_nested_whiteout(ofs, wdir, whiteout, is_proxy);
++
++		if (err) {
++			dput(whiteout);
++			whiteout = ERR_PTR(err);
++			goto out;
++		}
++		ofs->nested_whiteout = whiteout;
++	}
++	whiteout = ofs->nested_whiteout;
++	ofs->nested_whiteout = NULL;
++out:
++	return whiteout;
++}
++
+ /* caller holds i_mutex on workdir */
+ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
+ {
+@@ -69,6 +96,10 @@ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
+ 	struct dentry *workdir = ofs->workdir;
+ 	struct inode *wdir = workdir->d_inode;
+ 
++	if (workdir->d_flags & DCACHE_OP_REAL) {
++		return ovl_nested_whiteout(ofs, false);
++	}
++
+ 	if (!ofs->whiteout) {
+ 		whiteout = ovl_lookup_temp(ofs, workdir);
+ 		if (IS_ERR(whiteout))
+@@ -105,6 +136,38 @@ static struct dentry *ovl_whiteout(struct ovl_fs *ofs)
+ 	return whiteout;
+ }
+ 
++/* Caller must hold i_mutex on both workdir and dir */
++int ovl_nested_cleanup_and_whiteout(struct ovl_fs *ofs, struct inode *dir,
++				    struct dentry *dentry)
++{
++	struct inode *wdir = ofs->workdir->d_inode;
++	struct dentry *whiteout;
++	int err;
++	int flags = 0;
++
++	whiteout = ovl_nested_whiteout(ofs, true);
++	err = PTR_ERR(whiteout);
++	if (IS_ERR(whiteout))
++		return err;
++
++	if (d_is_dir(dentry))
++		flags = RENAME_EXCHANGE;
++
++	err = ovl_do_rename(ofs, wdir, whiteout, dir, dentry, flags);
++	if (err)
++		goto kill_whiteout;
++	if (flags)
++		ovl_cleanup(ofs, wdir, dentry);
++
++out:
++	dput(whiteout);
++	return err;
++
++kill_whiteout:
++	ovl_cleanup(ofs, wdir, whiteout);
++	goto out;
++}
++
+ /* Caller must hold i_mutex on both workdir and dir */
+ int ovl_cleanup_and_whiteout(struct ovl_fs *ofs, struct inode *dir,
+ 			     struct dentry *dentry)
+@@ -669,9 +732,14 @@ static int ovl_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+ static int ovl_mknod(struct mnt_idmap *idmap, struct inode *dir,
+ 		     struct dentry *dentry, umode_t mode, dev_t rdev)
+ {
+-	/* Don't allow creation of "whiteout" on overlay */
+-	if (S_ISCHR(mode) && rdev == WHITEOUT_DEV)
+-		return -EPERM;
++	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
++	int err;
++
++	/* Allow creation of "whiteout" on overlay as nested_whiteout */
++	if (S_ISCHR(mode) && rdev == WHITEOUT_DEV) {
++		err = ovl_do_nested_whiteout(ofs, dir, dentry, false);
++		return err;
++	}
+ 
+ 	return ovl_create_object(dentry, mode, rdev, NULL);
+ }
+@@ -1063,6 +1131,44 @@ static int ovl_set_redirect(struct dentry *dentry, bool samedir)
+ 	return err;
+ }
+ 
++/* Caller must hold i_mutex on both old_upperdir and new_upperdir */
++static int ovl_nested_whiteout_rename(struct dentry *dentry)
++{
++	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
++	struct dentry *workdir = ovl_workdir(dentry);
++	struct dentry *upperdir = ovl_dentry_upper(dentry->d_parent);
++	struct dentry *olddentry;
++	int err = -EIO;
++
++	if (upperdir == workdir) {
++		pr_err("ovl_nested_whiteout_rename: avoided to incur a deadlock\n");
++		goto err;
++	}
++
++	inode_lock_nested(workdir->d_inode, I_MUTEX_PARENT);
++	olddentry = ovl_lookup_upper(ofs, dentry->d_name.name, upperdir,
++				     dentry->d_name.len);
++	err = PTR_ERR(olddentry);
++	if (IS_ERR(olddentry))
++		goto out_unlock;
++
++	if (olddentry->d_inode) {
++		pr_warn("d_inode of olddentry exists\n");
++		goto out_dput_old;
++	}
++
++	err = ovl_nested_cleanup_and_whiteout(ofs, d_inode(upperdir), olddentry);
++	if (err)
++		pr_err("ovl_nested_whiteout_rename: ovl_cleanup_and_whiteout: %d\n", err);
++
++out_dput_old:
++	dput(olddentry);
++out_unlock:
++	inode_unlock(workdir->d_inode);
++err:
++	return err;
++}
++
+ static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
+ 		      struct dentry *old, struct inode *newdir,
+ 		      struct dentry *new, unsigned int flags)
+@@ -1081,16 +1187,19 @@ static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
+ 	bool is_dir = d_is_dir(old);
+ 	bool new_is_dir = d_is_dir(new);
+ 	bool samedir = olddir == newdir;
++	bool nested_whiteout_rename = false;
+ 	struct dentry *opaquedir = NULL;
+ 	const struct cred *old_cred = NULL;
+ 	struct ovl_fs *ofs = OVL_FS(old->d_sb);
+ 	LIST_HEAD(list);
+ 
+ 	err = -EINVAL;
+-	if (flags & ~(RENAME_EXCHANGE | RENAME_NOREPLACE))
++	if (flags & RENAME_WHITEOUT) {
++		nested_whiteout_rename = true;
++	} else if (flags & ~(RENAME_EXCHANGE | RENAME_NOREPLACE))
+ 		goto out;
+ 
+-	flags &= ~RENAME_NOREPLACE;
++	flags &= ~(RENAME_NOREPLACE | RENAME_WHITEOUT);
+ 
+ 	/* Don't copy up directory trees */
+ 	err = -EXDEV;
+@@ -1248,6 +1357,10 @@ static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
+ 	if (err)
+ 		goto out_dput;
+ 
++	if (nested_whiteout_rename) {
++		ovl_nested_whiteout_rename(old);
++	}
++
+ 	if (cleanup_whiteout)
+ 		ovl_cleanup(ofs, old_upperdir->d_inode, newdentry);
+ 
+diff --git a/fs/overlayfs/namei.c b/fs/overlayfs/namei.c
+index 22c29e5..c72c2f4 100644
+--- a/fs/overlayfs/namei.c
++++ b/fs/overlayfs/namei.c
+@@ -234,7 +234,6 @@ static int ovl_lookup_single(struct dentry *base, struct ovl_lookup_data *d,
+ 	struct path path;
+ 	int err;
+ 	bool last_element = !post[0];
+-	bool is_upper = d->layer->idx == 0;
+ 	char val;
+ 
+ 	this = ovl_lookup_positive_unlocked(d, name, base, namelen, drop_negative);
+@@ -294,7 +293,7 @@ static int ovl_lookup_single(struct dentry *base, struct ovl_lookup_data *d,
+ 
+ 		/* overlay.opaque=x means xwhiteouts directory */
+ 		val = ovl_get_opaquedir_val(ofs, &path);
+-		if (last_element && !is_upper && val == 'x') {
++		if (last_element && val == 'x') {
+ 			d->xwhiteouts = true;
+ 			ovl_layer_set_xwhiteouts(ofs, d->layer);
+ 		} else if (val == 'y') {
+@@ -1069,11 +1068,6 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+ 		if (err)
+ 			goto out;
+ 
+-		if (upperdentry && upperdentry->d_flags & DCACHE_OP_REAL) {
+-			dput(upperdentry);
+-			err = -EREMOTE;
+-			goto out;
+-		}
+ 		if (upperdentry && !d.is_dir) {
+ 			/*
+ 			 * Lookup copy up origin by decoding origin file handle.
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index 18132ab..2ab6dd2 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -39,6 +39,8 @@ enum ovl_path_type {
+ #define OVL_XATTR_ESCAPE_USER_PREFIX OVL_XATTR_USER_PREFIX OVL_XATTR_ESCAPE_PREFIX
+ #define OVL_XATTR_ESCAPE_USER_PREFIX_LEN (sizeof(OVL_XATTR_ESCAPE_USER_PREFIX) - 1)
+ 
++#define SHADOW_WHITEOUT_DEV 1
++
+ enum ovl_xattr {
+ 	OVL_XATTR_OPAQUE,
+ 	OVL_XATTR_REDIRECT,
+@@ -50,6 +52,8 @@ enum ovl_xattr {
+ 	OVL_XATTR_METACOPY,
+ 	OVL_XATTR_PROTATTR,
+ 	OVL_XATTR_XWHITEOUT,
++	OVL_NESTED_XATTR_XWHITEOUT,
++	OVL_NESTED_XATTR_OPAQUE,
+ };
+ 
+ enum ovl_inode_flag {
+@@ -71,6 +75,7 @@ enum ovl_entry_flag {
+ 	OVL_E_CONNECTED,
+ 	/* Lower stack may contain xwhiteout entries */
+ 	OVL_E_XWHITEOUTS,
++	OVL_E_NESTED_XWHITEOUTS,
+ };
+ 
+ enum {
+@@ -304,6 +309,19 @@ static inline ssize_t ovl_path_getxattr(struct ovl_fs *ofs,
+ 	return ovl_do_getxattr(path, ovl_xattr(ofs, ox), value, size);
+ }
+ 
++static inline int ovl_do_setxattr_locked(struct ovl_fs *ofs, struct dentry *dentry,
++                                         const char *name, const void *value,
++                                         size_t size, int flags)
++{
++	struct inode *delegated_inode = NULL;
++	int err = __vfs_setxattr_locked(ovl_upper_mnt_idmap(ofs), dentry, name,
++	                                 value, size, flags, &delegated_inode);
++
++	pr_debug("setxattr(%pd2, \"%s\", \"%*pE\", %zu, %d) = %i\n",
++		 dentry, name, min((int)size, 48), value, size, flags, err);
++	return err;
++}
++
+ static inline int ovl_do_setxattr(struct ovl_fs *ofs, struct dentry *dentry,
+ 				  const char *name, const void *value,
+ 				  size_t size, int flags)
+@@ -381,6 +399,25 @@ static inline int ovl_do_whiteout(struct ovl_fs *ofs,
+ 	return err;
+ }
+ 
++static inline int ovl_do_nested_whiteout(struct ovl_fs *ofs,
++                                         struct inode *dir, struct dentry *dentry,
++                                         bool is_proxy)
++{
++	int err = ovl_do_mknod(ofs, dir, dentry, S_IFCHR, SHADOW_WHITEOUT_DEV);
++	if (err) {
++		pr_err("ovl_do_nested_whiteout: failed to create regular file %i\n", err);
++		return err;
++	}
++	err = ovl_setxattr(ofs, dentry,
++	                   is_proxy ? OVL_NESTED_XATTR_XWHITEOUT : OVL_XATTR_XWHITEOUT,
++	                   NULL, 0);
++	if (err) {
++		pr_err("ovl_do_nested_whiteout: failed to set xwhiteout %i\n", err);
++		return err;
++	}
++	return err;
++}
++
+ static inline struct file *ovl_do_tmpfile(struct ovl_fs *ofs,
+ 					  struct dentry *dentry, umode_t mode)
+ {
+@@ -497,6 +534,7 @@ char ovl_get_dir_xattr_val(struct ovl_fs *ofs, const struct path *path,
+ 			   enum ovl_xattr ox);
+ bool ovl_path_check_origin_xattr(struct ovl_fs *ofs, const struct path *path);
+ bool ovl_path_check_xwhiteout_xattr(struct ovl_fs *ofs, const struct path *path);
++bool ovl_path_check_shadow_whiteout_xattr(struct ovl_fs *ofs, const struct path *path);
+ bool ovl_init_uuid_xattr(struct super_block *sb, struct ovl_fs *ofs,
+ 			 const struct path *upperpath);
+ 
+diff --git a/fs/overlayfs/ovl_entry.h b/fs/overlayfs/ovl_entry.h
+index f02c4bf..0ad7c60 100644
+--- a/fs/overlayfs/ovl_entry.h
++++ b/fs/overlayfs/ovl_entry.h
+@@ -91,6 +91,7 @@ struct ovl_fs {
+ 	/* Shared whiteout cache */
+ 	struct dentry *whiteout;
+ 	bool no_shared_whiteout;
++	struct dentry *nested_whiteout;
+ 	/* r/o snapshot of upperdir sb's only taken on volatile mounts */
+ 	errseq_t errseq;
+ };
+diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
+index 488f920..a5cc59d 100644
+--- a/fs/overlayfs/params.c
++++ b/fs/overlayfs/params.c
+@@ -302,7 +302,7 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
+ 	 */
+ 	if (upper) {
+ 		if (path->dentry->d_flags & DCACHE_OP_REAL)
+-			return invalfc(fc, "filesystem on %s not supported as upperdir", name);
++			pr_info("[Modified] allow to use overlayfs as upperdir\n");
+ 		if (__mnt_is_readonly(path->mnt))
+ 			return invalfc(fc, "filesystem on %s is read-only", name);
+ 	} else {
+@@ -754,6 +754,7 @@ void ovl_free_fs(struct ovl_fs *ofs)
+ 	iput(ofs->indexdir_trap);
+ 	iput(ofs->workdir_trap);
+ 	dput(ofs->whiteout);
++	dput(ofs->nested_whiteout);
+ 	dput(ofs->indexdir);
+ 	dput(ofs->workdir);
+ 	if (ofs->workdir_locked)
+diff --git a/fs/overlayfs/readdir.c b/fs/overlayfs/readdir.c
+index 8e8545b..1e10c0d 100644
+--- a/fs/overlayfs/readdir.c
++++ b/fs/overlayfs/readdir.c
+@@ -284,7 +284,15 @@ static int ovl_check_whiteouts(const struct path *path, struct ovl_readdir_data
+ 			rdd->first_maybe_whiteout = p->next_maybe_whiteout;
+ 			dentry = lookup_one(mnt_idmap(path->mnt), p->name, dir, p->len);
+ 			if (!IS_ERR(dentry)) {
+-				p->is_whiteout = ovl_is_whiteout(dentry);
++				if (rdd->is_upper)
++					p->is_whiteout = ovl_upper_is_whiteout(OVL_FS(rdd->dentry->d_sb), dentry);
++				else {
++					struct path wo_path = {
++						.dentry = dentry,
++						.mnt = path->mnt,
++					};
++					p->is_whiteout = ovl_path_is_whiteout(OVL_FS(rdd->dentry->d_sb), &wo_path);
++				}
+ 				dput(dentry);
+ 			}
+ 		}
+diff --git a/fs/overlayfs/util.c b/fs/overlayfs/util.c
+index cd07223..bc38c2f 100644
+--- a/fs/overlayfs/util.c
++++ b/fs/overlayfs/util.c
+@@ -635,7 +635,8 @@ bool ovl_is_whiteout(struct dentry *dentry)
+ bool ovl_path_is_whiteout(struct ovl_fs *ofs, const struct path *path)
+ {
+ 	return ovl_is_whiteout(path->dentry) ||
+-		ovl_path_check_xwhiteout_xattr(ofs, path);
++		ovl_path_check_xwhiteout_xattr(ofs, path) ||
++		ovl_path_check_shadow_whiteout_xattr(ofs, path);
+ }
+ 
+ struct file *ovl_path_open(const struct path *path, int flags)
+@@ -766,6 +767,25 @@ bool ovl_path_check_xwhiteout_xattr(struct ovl_fs *ofs, const struct path *path)
+ 	return res >= 0;
+ }
+ 
++bool ovl_path_check_shadow_whiteout_xattr(struct ovl_fs *ofs, const struct path *path)
++{
++	struct dentry *dentry = path->dentry;
++	struct inode *inode;
++	int res;
++
++	if (!dentry)
++		return false;
++
++	inode = dentry->d_inode;
++
++	/* shadow xattr.whiteout must be a zero size chr file */
++	if (!inode || !S_ISCHR(inode->i_mode) || i_size_read(d_inode(dentry)) != 0)
++		return false;
++
++	res = ovl_path_getxattr(ofs, path, OVL_XATTR_XWHITEOUT, NULL, 0);
++	return res >= 0;
++}
++
+ /*
+  * Load persistent uuid from xattr into s_uuid if found, or store a new
+  * random generated value in s_uuid and in xattr.
+@@ -848,11 +868,17 @@ char ovl_get_dir_xattr_val(struct ovl_fs *ofs, const struct path *path,
+ #define OVL_XATTR_METACOPY_POSTFIX	"metacopy"
+ #define OVL_XATTR_PROTATTR_POSTFIX	"protattr"
+ #define OVL_XATTR_XWHITEOUT_POSTFIX	"whiteout"
++#define OVL_NESTED_XATTR_XWHITEOUT_POSTFIX	"whiteout"
++#define OVL_NESTED_XATTR_OPAQUE_POSTFIX	"opaque"
+ 
+ #define OVL_XATTR_TAB_ENTRY(x) \
+ 	[x] = { [false] = OVL_XATTR_TRUSTED_PREFIX x ## _POSTFIX, \
+ 		[true] = OVL_XATTR_USER_PREFIX x ## _POSTFIX }
+ 
++#define OVL_ESCAPE_XATTR_TAB_ENTRY(x) \
++	[x] = { [false] = OVL_XATTR_ESCAPE_TRUSTED_PREFIX x ## _POSTFIX, \
++		[true] = OVL_XATTR_ESCAPE_TRUSTED_PREFIX x ## _POSTFIX }
++
+ const char *const ovl_xattr_table[][2] = {
+ 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_OPAQUE),
+ 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_REDIRECT),
+@@ -864,6 +890,8 @@ const char *const ovl_xattr_table[][2] = {
+ 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_METACOPY),
+ 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_PROTATTR),
+ 	OVL_XATTR_TAB_ENTRY(OVL_XATTR_XWHITEOUT),
++	OVL_ESCAPE_XATTR_TAB_ENTRY(OVL_NESTED_XATTR_XWHITEOUT),
++	OVL_ESCAPE_XATTR_TAB_ENTRY(OVL_NESTED_XATTR_OPAQUE),
+ };
+ 
+ int ovl_check_setxattr(struct ovl_fs *ofs, struct dentry *upperdentry,
