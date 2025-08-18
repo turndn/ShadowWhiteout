@@ -471,6 +471,16 @@ void ovl_dentry_set_xwhiteouts(struct dentry *dentry)
 	ovl_dentry_set_flag(OVL_E_XWHITEOUTS, dentry);
 }
 
+bool ovl_dentry_has_nested_xwhiteouts(struct dentry *dentry)
+{
+	return ovl_dentry_test_flag(OVL_E_NESTED_XWHITEOUTS, dentry);
+}
+
+void ovl_dentry_set_nested_xwhiteouts(struct dentry *dentry)
+{
+	ovl_dentry_set_flag(OVL_E_NESTED_XWHITEOUTS, dentry);
+}
+
 /*
  * ovl_layer_set_xwhiteouts() is called before adding the overlay dir
  * dentry to dcache, while readdir of that same directory happens after
@@ -635,8 +645,7 @@ bool ovl_is_whiteout(struct dentry *dentry)
 bool ovl_path_is_whiteout(struct ovl_fs *ofs, const struct path *path)
 {
 	return ovl_is_whiteout(path->dentry) ||
-		ovl_path_check_xwhiteout_xattr(ofs, path) ||
-		ovl_path_check_shadow_whiteout_xattr(ofs, path);
+		ovl_path_check_xwhiteout_xattr(ofs, path);
 }
 
 struct file *ovl_path_open(const struct path *path, int flags)
@@ -761,25 +770,6 @@ bool ovl_path_check_xwhiteout_xattr(struct ovl_fs *ofs, const struct path *path)
 
 	/* xattr.whiteout must be a zero size regular file */
 	if (!d_is_reg(dentry) || i_size_read(d_inode(dentry)) != 0)
-		return false;
-
-	res = ovl_path_getxattr(ofs, path, OVL_XATTR_XWHITEOUT, NULL, 0);
-	return res >= 0;
-}
-
-bool ovl_path_check_shadow_whiteout_xattr(struct ovl_fs *ofs, const struct path *path)
-{
-	struct dentry *dentry = path->dentry;
-	struct inode *inode;
-	int res;
-
-	if (!dentry)
-		return false;
-
-	inode = dentry->d_inode;
-
-	/* shadow xattr.whiteout must be a zero size chr file */
-	if (!inode || !S_ISCHR(inode->i_mode) || i_size_read(d_inode(dentry)) != 0)
 		return false;
 
 	res = ovl_path_getxattr(ofs, path, OVL_XATTR_XWHITEOUT, NULL, 0);

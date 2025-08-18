@@ -167,7 +167,7 @@ static struct ovl_cache_entry *ovl_cache_entry_new(struct ovl_readdir_data *rdd,
 	/* Defer check for overlay.whiteout to ovl_iterate() */
 	p->check_xwhiteout = rdd->in_xwhiteouts_dir && d_type == DT_REG;
 
-	if (d_type == DT_CHR) {
+	if (d_type == DT_CHR || p->check_xwhiteout) {
 		p->next_maybe_whiteout = rdd->first_maybe_whiteout;
 		rdd->first_maybe_whiteout = p;
 	}
@@ -370,8 +370,11 @@ static int ovl_dir_read_merged(struct dentry *dentry, struct list_head *list,
 	for (idx = 0; idx != -1; idx = next) {
 		next = ovl_path_next(idx, dentry, &realpath, &layer);
 		rdd.is_upper = ovl_dentry_upper(dentry) == realpath.dentry;
-		rdd.in_xwhiteouts_dir = layer->has_xwhiteouts &&
-					ovl_dentry_has_xwhiteouts(dentry);
+		if (ovl_dentry_has_xwhiteouts(dentry) || ovl_dentry_has_nested_xwhiteouts(realpath.dentry)) {
+			if (!ovl_dentry_has_xwhiteouts(dentry))
+			    ovl_dentry_set_xwhiteouts(dentry);
+			rdd.in_xwhiteouts_dir = true;
+		}
 
 		if (next != -1) {
 			err = ovl_dir_read(&realpath, &rdd);

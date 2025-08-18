@@ -294,6 +294,37 @@ struct dentry *ovl_create_temp(struct ovl_fs *ofs, struct dentry *workdir,
 			       ovl_lookup_temp(ofs, workdir), attr);
 }
 
+static int ovl_check_setxattr_locked(struct ovl_fs *ofs, struct dentry *upperdentry,
+				     enum ovl_xattr ox, const void *value, size_t size,
+				     int xerr)
+{
+	int err;
+
+	if (ofs->noxattr)
+		return xerr;
+
+	err = ovl_do_setxattr_locked(ofs, upperdentry, ovl_xattr(ofs, ox), value, size, 0);
+
+	if (err == -EOPNOTSUPP) {
+		pr_warn("cannot set %s xattr on upper\n", ovl_xattr(ofs, ox));
+		ofs->noxattr = true;
+		return xerr;
+	}
+
+	return err;
+}
+
+static int ovl_set_opaque_xwhiteouts_locked(struct dentry *dentry, struct dentry *upper, bool is_proxy)
+{
+	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
+	int err;
+
+	err = ovl_check_setxattr_locked(ofs, upper, is_proxy ? OVL_NESTED_XATTR_OPAQUE : OVL_XATTR_OPAQUE,
+					"x", 1, 1);
+
+	return err;
+}
+
 static int ovl_set_opaque_xerr(struct dentry *dentry, struct dentry *upper,
 			       int xerr)
 {
@@ -738,6 +769,15 @@ static int ovl_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	/* Allow creation of "whiteout" on overlay as nested_whiteout */
 	if (S_ISCHR(mode) && rdev == WHITEOUT_DEV) {
 		err = ovl_do_nested_whiteout(ofs, dir, dentry, false);
+
+		if (err) {
+			return err;
+		}
+
+		err = ovl_set_opaque_xwhiteouts_locked(dentry->d_parent, dentry->d_parent, false);
+
+		if (!err)
+			ovl_dentry_set_nested_xwhiteouts(dentry->d_parent);
 		return err;
 	}
 
@@ -848,6 +888,11 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
 		goto out_d_drop;
 
 	ovl_dir_modified(dentry->d_parent, true);
+	if (upper->d_flags & DCACHE_OP_REAL) {
+		err = ovl_set_opaque_xwhiteouts_locked(dentry->d_parent, upperdir, false);
+		if (!err)
+			ovl_dentry_set_xwhiteouts(dentry->d_parent);
+	}
 out_d_drop:
 	d_drop(dentry);
 out_dput_upper:
@@ -1174,6 +1219,7 @@ static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		      struct dentry *new, unsigned int flags)
 {
 	int err;
+	int nested_whiteout_err;
 	struct dentry *old_upperdir;
 	struct dentry *new_upperdir;
 	struct dentry *olddentry;
@@ -1358,7 +1404,11 @@ static int ovl_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		goto out_dput;
 
 	if (nested_whiteout_rename) {
-		ovl_nested_whiteout_rename(old);
+		nested_whiteout_err = ovl_nested_whiteout_rename(old);
+		if (!nested_whiteout_err)
+			nested_whiteout_err = ovl_set_opaque_xwhiteouts_locked(old->d_parent, old_upperdir, true);
+		if (!nested_whiteout_err)
+			ovl_dentry_set_nested_xwhiteouts(old->d_parent);
 	}
 
 	if (cleanup_whiteout)

@@ -39,8 +39,6 @@ enum ovl_path_type {
 #define OVL_XATTR_ESCAPE_USER_PREFIX OVL_XATTR_USER_PREFIX OVL_XATTR_ESCAPE_PREFIX
 #define OVL_XATTR_ESCAPE_USER_PREFIX_LEN (sizeof(OVL_XATTR_ESCAPE_USER_PREFIX) - 1)
 
-#define SHADOW_WHITEOUT_DEV 1
-
 enum ovl_xattr {
 	OVL_XATTR_OPAQUE,
 	OVL_XATTR_REDIRECT,
@@ -403,7 +401,7 @@ static inline int ovl_do_nested_whiteout(struct ovl_fs *ofs,
                                          struct inode *dir, struct dentry *dentry,
                                          bool is_proxy)
 {
-	int err = ovl_do_mknod(ofs, dir, dentry, S_IFCHR, SHADOW_WHITEOUT_DEV);
+	int err = ovl_do_create(ofs, dir, dentry, S_IRUSR);
 	if (err) {
 		pr_err("ovl_do_nested_whiteout: failed to create regular file %i\n", err);
 		return err;
@@ -511,6 +509,8 @@ bool ovl_dentry_is_whiteout(struct dentry *dentry);
 void ovl_dentry_set_opaque(struct dentry *dentry);
 bool ovl_dentry_has_xwhiteouts(struct dentry *dentry);
 void ovl_dentry_set_xwhiteouts(struct dentry *dentry);
+bool ovl_dentry_has_nested_xwhiteouts(struct dentry *dentry);
+void ovl_dentry_set_nested_xwhiteouts(struct dentry *dentry);
 void ovl_layer_set_xwhiteouts(struct ovl_fs *ofs,
 			      const struct ovl_layer *layer);
 bool ovl_dentry_has_upper_alias(struct dentry *dentry);
@@ -534,7 +534,6 @@ char ovl_get_dir_xattr_val(struct ovl_fs *ofs, const struct path *path,
 			   enum ovl_xattr ox);
 bool ovl_path_check_origin_xattr(struct ovl_fs *ofs, const struct path *path);
 bool ovl_path_check_xwhiteout_xattr(struct ovl_fs *ofs, const struct path *path);
-bool ovl_path_check_shadow_whiteout_xattr(struct ovl_fs *ofs, const struct path *path);
 bool ovl_init_uuid_xattr(struct super_block *sb, struct ovl_fs *ofs,
 			 const struct path *upperpath);
 
