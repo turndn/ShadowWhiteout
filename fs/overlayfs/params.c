@@ -301,8 +301,13 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
 	 * as the mount attributes could change.
 	 */
 	if (upper) {
-		if (path->dentry->d_flags & DCACHE_OP_REAL)
-			pr_info("[Modified] allow to use overlayfs as upperdir\n");
+		if (path->dentry->d_flags & DCACHE_OP_REAL) {
+			if (path->dentry->d_sb->s_type == &ovl_fs_type)
+				pr_info("[Modified] allow to use overlayfs as upperdir\n");
+			else
+				return invalfc(fc, "filesystem on %s not supported as upperdir",
+					       name);
+		}
 		if (__mnt_is_readonly(path->mnt))
 			return invalfc(fc, "filesystem on %s is read-only", name);
 	} else {

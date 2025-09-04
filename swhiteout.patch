@@ -183,7 +183,7 @@ index aab3f5d..63bf343 100644
  		ovl_cleanup(ofs, old_upperdir->d_inode, newdentry);
  
 diff --git a/fs/overlayfs/namei.c b/fs/overlayfs/namei.c
-index 22c29e5..c72c2f4 100644
+index 22c29e5..fd5ab68 100644
 --- a/fs/overlayfs/namei.c
 +++ b/fs/overlayfs/namei.c
 @@ -234,7 +234,6 @@ static int ovl_lookup_single(struct dentry *base, struct ovl_lookup_data *d,
@@ -203,18 +203,16 @@ index 22c29e5..c72c2f4 100644
  			d->xwhiteouts = true;
  			ovl_layer_set_xwhiteouts(ofs, d->layer);
  		} else if (val == 'y') {
-@@ -1069,11 +1068,6 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
+@@ -1069,7 +1068,8 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
  		if (err)
  			goto out;
  
 -		if (upperdentry && upperdentry->d_flags & DCACHE_OP_REAL) {
--			dput(upperdentry);
--			err = -EREMOTE;
--			goto out;
--		}
- 		if (upperdentry && !d.is_dir) {
- 			/*
- 			 * Lookup copy up origin by decoding origin file handle.
++		if (upperdentry && upperdentry->d_flags & DCACHE_OP_REAL &&
++		    upperdentry->d_sb->s_type != &ovl_fs_type) {
+ 			dput(upperdentry);
+ 			err = -EREMOTE;
+ 			goto out;
 diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
 index 18132ab..2ab6dd2 100644
 --- a/fs/overlayfs/overlayfs.h
@@ -312,19 +310,26 @@ index f02c4bf..0ad7c60 100644
  	errseq_t errseq;
  };
 diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
-index 488f920..a5cc59d 100644
+index 488f920..aa986fd 100644
 --- a/fs/overlayfs/params.c
 +++ b/fs/overlayfs/params.c
-@@ -302,7 +302,7 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
+@@ -301,8 +301,13 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
+ 	 * as the mount attributes could change.
  	 */
  	if (upper) {
- 		if (path->dentry->d_flags & DCACHE_OP_REAL)
+-		if (path->dentry->d_flags & DCACHE_OP_REAL)
 -			return invalfc(fc, "filesystem on %s not supported as upperdir", name);
-+			pr_info("[Modified] allow to use overlayfs as upperdir\n");
++		if (path->dentry->d_flags & DCACHE_OP_REAL) {
++			if (path->dentry->d_sb->s_type == &ovl_fs_type)
++				pr_info("[Modified] allow to use overlayfs as upperdir\n");
++			else
++				return invalfc(fc, "filesystem on %s not supported as upperdir",
++					       name);
++		}
  		if (__mnt_is_readonly(path->mnt))
  			return invalfc(fc, "filesystem on %s is read-only", name);
  	} else {
-@@ -754,6 +754,7 @@ void ovl_free_fs(struct ovl_fs *ofs)
+@@ -754,6 +759,7 @@ void ovl_free_fs(struct ovl_fs *ofs)
  	iput(ofs->indexdir_trap);
  	iput(ofs->workdir_trap);
  	dput(ofs->whiteout);

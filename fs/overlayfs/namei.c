@@ -1068,6 +1068,12 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
 		if (err)
 			goto out;
 
+		if (upperdentry && upperdentry->d_flags & DCACHE_OP_REAL &&
+		    upperdentry->d_sb->s_type != &ovl_fs_type) {
+			dput(upperdentry);
+			err = -EREMOTE;
+			goto out;
+		}
 		if (upperdentry && !d.is_dir) {
 			/*
 			 * Lookup copy up origin by decoding origin file handle.
